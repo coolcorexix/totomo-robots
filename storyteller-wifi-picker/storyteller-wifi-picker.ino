@@ -51,8 +51,8 @@ struct WifiConfig {
 };
 
 const WifiConfig WIFI_CONFIGS[] = {
-    { "Nha",        "HomeWiFi_2G",   "home_password"     },
-    { "Van phong",  "Office_WiFi",   "office_password"   },
+    { "To To Mo",        "To To Mo",   "biethoidehoc"     },
+    { "CT1-1009",  "Nha Meo Va Phat",   "12345678"   },
     { "Dien thoai", "Hotspot_Phat",  "hotspot_password"  },
 };
 const int WIFI_COUNT = sizeof(WIFI_CONFIGS) / sizeof(WIFI_CONFIGS[0]);

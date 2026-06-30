@@ -1,0 +1,72 @@
+#cloud-config
+# Runs automatically on first boot of the Oracle ARM VM.
+# Sets up base system; custom files are pushed later by sync-server.sh.
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - python3.11
+  - python3.11-venv
+  - python3-pip
+  - ffmpeg
+  - git
+  - curl
+  - ufw
+  - libopus-dev
+  - build-essential
+
+write_files:
+  - path: /etc/systemd/system/totomo-voice.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Totomo Voice Server
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      User=totomo
+      WorkingDirectory=/opt/totomo/server/main/xiaozhi-server
+      ExecStart=/opt/totomo/venv/bin/python app.py
+      Restart=always
+      RestartSec=5
+      StandardOutput=journal
+      StandardError=journal
+      SyslogIdentifier=totomo-voice
+      Environment="PYTHONUNBUFFERED=1"
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  # Create service user and install directory
+  - useradd -r -s /bin/false -d /opt/totomo totomo
+  - mkdir -p /opt/totomo
+  - chown totomo:totomo /opt/totomo
+
+  # Clone upstream xiaozhi server
+  - git clone https://github.com/xinnan-tech/xiaozhi-esp32-server /opt/totomo/server
+
+  # Python venv + deps (strip vosk — no arm64 wheel)
+  - python3.11 -m venv /opt/totomo/venv
+  - grep -v "vosk" /opt/totomo/server/main/xiaozhi-server/requirements.txt > /tmp/req.txt
+  - /opt/totomo/venv/bin/pip install --upgrade pip -q
+  - /opt/totomo/venv/bin/pip install -r /tmp/req.txt -q
+
+  # Fix ownership
+  - chown -R totomo:totomo /opt/totomo
+
+  # Firewall: allow SSH + voice server port
+  - ufw allow 22/tcp
+  - ufw allow 8000/tcp
+  - ufw --force enable
+
+  # Enable service (won't start yet — needs .config.yaml first)
+  - systemctl daemon-reload
+  - systemctl enable totomo-voice
+
+final_message: |
+  ✅ Totomo base setup complete.
+  Next: run deploy/sync-server.sh from your Mac to push custom files + config.
