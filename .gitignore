@@ -1,0 +1,10 @@
+# PlatformIO build artifacts
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Secrets (never commit WiFi passwords or API keys)
+**/config_secrets.h
+**/.env
+
+.DS_Store

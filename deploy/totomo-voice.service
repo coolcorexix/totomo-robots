@@ -1,0 +1,23 @@
+[Unit]
+Description=Totomo Voice Server (xiaozhi-esp32-server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=totomo
+WorkingDirectory=__INSTALL_DIR__/server/main/xiaozhi-server
+ExecStart=__INSTALL_DIR__/venv/bin/python app.py
+Restart=always
+RestartSec=5
+
+# Keep logs clean
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=totomo-voice
+
+# Env vars (add API keys here or use .config.yaml)
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target
