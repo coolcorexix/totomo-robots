@@ -1,12 +1,12 @@
 /**
- * HS-01 Chatbot  —  ESP32-S3 + INMP441 + MAX98357A
+ * HS-01 Chatbot  —  ESP32-S3 + INMP441 + MAX98357A + ST7789
  *
- * Press & hold the button → speak → release → server transcribes your
- * voice (Deepgram nova-2), thinks (DeepSeek), talks back (EdgeTTS Opus)
- * through the speaker.  Works over WiFi — no cloud accounts on the chip.
+ * Boot:  on-screen WiFi picker  →  tap to move   hold to select
+ *        or pick "Phone Setup" → connect your phone to the AP
+ *          → open captive portal → choose any WiFi.
  *
- * Protocol : xiaozhi WebSocket
- * Server   : totomo-voice.fly.dev  (Fly.io Singapore, always on)
+ * Chat:  hold button → speak → release → server transcribes
+ *        (Deepgram), thinks (DeepSeek), talks back (EdgeTTS / Opus).
  */
 
 #include <Arduino.h>
@@ -15,7 +15,57 @@
 #include <ArduinoJson.h>
 #include <driver/i2s.h>
 #include <opus.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+
 #include "config.h"
+#include "../shared/hs01_wifi.h"
+
+/* ── Display ───────────────────────────────────────────────────── */
+static Adafruit_ST7789 tft(PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST);
+
+static void tft_init() {
+    tft.init(240, 240);
+    tft.setRotation(0);
+    tft.fillScreen(TFT_BG);
+}
+
+static void tft_header(const char* title, uint16_t color = ST77XX_GREEN) {
+    tft.fillScreen(TFT_BG);
+    tft.setTextSize(3);
+    tft.setTextColor(color);
+    tft.setCursor(10, 30);
+    tft.println(title);
+    tft.drawLine(0, 80, 240, 80, ST77XX_WHITE);
+}
+
+static void tft_connection(const char* ip) {
+    tft.setTextSize(2);
+    tft.setTextColor(ST77XX_CYAN);
+    tft.setCursor(10, 110);
+    tft.println("IP:");
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setCursor(10, 140);
+    tft.println(ip);
+    tft.setTextSize(2);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setCursor(10, 180);
+    tft.println("Hold BTN to talk");
+}
+
+static void tft_status(const char* line1, const char* line2, uint16_t c1 = ST77XX_WHITE) {
+    tft.fillRect(0, 100, 240, 140, TFT_BG);
+    tft.setTextSize(2);
+    tft.setTextColor(c1);
+    tft.setCursor(10, 110);
+    tft.println(line1);
+    if (line2 && line2[0]) {
+        tft.setTextSize(1);
+        tft.setTextColor(ST77XX_CYAN);
+        tft.setCursor(10, 145);
+        tft.println(line2);
+    }
+}
 
 /* ── State machine ──────────────────────────────────────────────── */
 enum State { IDLE, LISTENING, PROCESSING, SPEAKING };
@@ -25,17 +75,6 @@ static State state = IDLE;
 static WebSocketsClient ws;
 static String  sessionId   = "";
 static bool    helloAcked  = false;
-
-/* ── Display helpers ────────────────────────────────────────────── */
-static const char* state_label(State s) {
-    switch (s) {
-        case IDLE:        return "IDLE";
-        case LISTENING:   return "🎤 Listening…";
-        case PROCESSING:  return "⏳ Thinking…";
-        case SPEAKING:    return "🔊 Speaking…";
-        default:          return "???";
-    }
-}
 
 /* ── I2S — INMP441 mic (RX) ────────────────────────────────────── */
 static void i2s_mic_init() {
@@ -53,8 +92,7 @@ static void i2s_mic_init() {
         .fixed_mclk           = 0,
     };
     i2s_pin_config_t pins = {
-        .bck_io_num   = PIN_MIC_SCK,
-        .ws_io_num    = PIN_MIC_WS,
+        .bck_io_num   = PIN_MIC_SCK, .ws_io_num      = PIN_MIC_WS,
         .data_out_num = I2S_PIN_NO_CHANGE,
         .data_in_num  = PIN_MIC_SD,
     };
@@ -79,8 +117,7 @@ static void i2s_spk_init() {
         .fixed_mclk           = 0,
     };
     i2s_pin_config_t pins = {
-        .bck_io_num   = PIN_SPK_BCLK,
-        .ws_io_num    = PIN_SPK_LRC,
+        .bck_io_num   = PIN_SPK_BCLK, .ws_io_num      = PIN_SPK_LRC,
         .data_out_num = PIN_SPK_DIN,
         .data_in_num  = I2S_PIN_NO_CHANGE,
     };
@@ -106,7 +143,7 @@ static void opus_play(const uint8_t* data, size_t len) {
     if (!opusDec) return;
     int n = opus_decode(opusDec, data, (opus_int32)len,
                         opusPcm, TTS_FRAME_SAMPLES, 0);
-    if (n <= 0) { Serial.printf("[OPUS] decode %d\n", n); return; }
+    if (n <= 0) { Serial.printf("[OPUS] err %d\n", n); return; }
     size_t w = 0;
     i2s_write(I2S_NUM_1, opusPcm, n * sizeof(int16_t), &w, portMAX_DELAY);
 }
@@ -131,11 +168,11 @@ static void ws_hello() {
     ws_emit(d);
 }
 
-static void ws_listen(const char* st, const char* mode = "manual") {
+static void ws_listen(const char* st) {
     StaticJsonDocument<128> d;
     d["type"]       = "listen";
     d["state"]      = st;
-    d["mode"]       = mode;
+    d["mode"]       = "manual";
     d["session_id"] = sessionId;
     ws_emit(d);
 }
@@ -161,7 +198,8 @@ static void on_ws(WStype_t t, uint8_t* payload, size_t len) {
         helloAcked = false;
         sessionId  = "";
         state      = IDLE;
-        Serial.println("[WS] closed  (will auto-reconnect)");
+        tft_status("Offline", "reconnecting…", ST77XX_RED);
+        Serial.println("[WS] closed");
         break;
 
     case WStype_TEXT: {
@@ -174,28 +212,31 @@ static void on_ws(WStype_t t, uint8_t* payload, size_t len) {
             sessionId  = d["session_id"] | "";
             helloAcked = true;
             Serial.printf("[WS] ready · session=%s\n", sessionId.c_str());
+            tft_status("Online", "Hold BTN to talk", ST77XX_GREEN);
             state = IDLE;
 
         } else if (!strcmp(mt, "stt")) {
             const char* txt = d["text"] | "";
             if (txt[0] && txt[0] != '%') {
-                Serial.printf("[STT] \"%s\"\n", txt);
+                Serial.printf("[STT] %s\n", txt);
+                tft_status("Thinking…", txt, ST77XX_YELLOW);
                 state = PROCESSING;
             }
 
         } else if (!strcmp(mt, "llm")) {
-            Serial.printf("[😊]   %s\n", d["text"] | "");
+            Serial.printf("[LLM] %s\n", d["text"] | "");
 
         } else if (!strcmp(mt, "tts")) {
             const char* s = d["state"] | "";
             if (!strcmp(s, "start")) {
                 state = SPEAKING;
-                Serial.println("[TTS] ▸");
-            } else if (!strcmp(s, "sentence_start"))
-                Serial.printf("[TTS]   “%s”\n", d["text"] | "");
-            else if (!strcmp(s, "stop")) {
+            } else if (!strcmp(s, "sentence_start")) {
+                Serial.printf("[TTS] %s\n", d["text"] | "");
+                tft_status("Speaking…", d["text"] | "", ST77XX_CYAN);
+            } else if (!strcmp(s, "stop")) {
+                Serial.println("[TTS] done");
                 state = IDLE;
-                Serial.println("[TTS] ◂  (done)");
+                tft_status("Online", "Hold BTN to talk", ST77XX_GREEN);
             }
         }
         break;
@@ -226,24 +267,26 @@ static void handle_button() {
         unsigned long held = millis() - btnPressAt;
         btnPrev = HIGH;
 
-        if (held >= BTN_LONG_PRESS_MS) {      // long press = abort
+        if (held >= BTN_LONG_PRESS_MS) {
             if (state != IDLE) { ws_abort(); state = IDLE; }
+            tft_status("Online", "Hold BTN to talk", ST77XX_GREEN);
             Serial.println("[BTN] abort");
-        } else if (pttActive) {               // normal release → stop mic
+        } else if (pttActive) {
             pttActive = false;
             ws_listen("stop");
             state = PROCESSING;
+            tft_status("Thinking…", "", ST77XX_YELLOW);
             Serial.printf("[BTN] stop · %lu ms\n", held);
         }
     }
 
-    // while held → start mic if ready
     if (cur == LOW && !pttActive && helloAcked && state == IDLE) {
         if ((millis() - btnPressAt) > 50) {
             pttActive = true;
             state     = LISTENING;
             ws_listen("start");
-            Serial.println("[BTN] 🎤 start");
+            tft_status("Listening…", "release to send", ST77XX_ORANGE);
+            Serial.println("[BTN] start");
         }
     }
     btnPrev = cur;
@@ -263,29 +306,33 @@ static void stream_mic() {
     ws.sendBIN((const uint8_t*)micPcm, n * sizeof(int16_t));
 }
 
-/* ── WiFi ──────────────────────────────────────────────────────── */
-static void wifi_connect() {
-    Serial.printf("[WiFi] %s", WIFI_SSID);
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-    Serial.printf("  ✓  %s\n", WiFi.localIP().toString().c_str());
-}
-
 /* ── Entry ─────────────────────────────────────────────────────── */
+static const hs01::WifiConfig WIFI_LIST[HS01_WIFI_COUNT] = HS01_WIFI_LIST;
+
 void setup() {
     Serial.begin(115200);
     delay(500);
     Serial.println("\n════════════════════════════");
     Serial.println("  HS-01 Chatbot");
     Serial.println("  server  totomo-voice.fly.dev:80");
-    Serial.println("════════════════════════════\n");
+    Serial.println("════════════════════════════");
 
     pinMode(PIN_BTN, INPUT_PULLUP);
+    tft_init();
+    tft_header("HS-01 Chatbot", ST77XX_WHITE);
+
     i2s_mic_init();
     i2s_spk_init();
     opus_init();
-    wifi_connect();
+
+    // Blocking WiFi picker — tap to move, hold to select.
+    // "Phone Setup" entry launches an AP portal.
+    hs01::WifiSelect wifi(tft, PIN_BTN, WIFI_LIST,
+                          sizeof(WIFI_LIST)/sizeof(WIFI_LIST[0]), TFT_BG);
+    wifi.connect();
+
+    tft_header("Chatbot");
+    tft_connection(WiFi.localIP().toString().c_str());
 
     String path = "/xiaozhi/v1/?device-id=";
     path += DEVICE_ID;
@@ -296,21 +343,12 @@ void setup() {
     ws.onEvent(on_ws);
     ws.setReconnectInterval(3000);
 
-    Serial.printf("[WS]  ws://%s:%d%s\n", SERVER_HOST, SERVER_PORT, path.c_str());
-    Serial.println("      Hold button to talk.\n");
+    Serial.printf("[WS] ws://%s:%d%s\n", SERVER_HOST, SERVER_PORT, path.c_str());
 }
 
 void loop() {
     ws.loop();
     handle_button();
-
     if (state == LISTENING && pttActive)
         stream_mic();
-
-    // Log state changes to serial
-    static State lastState = IDLE;
-    if (state != lastState) {
-        Serial.printf("[→]   %s\n", state_label(state));
-        lastState = state;
-    }
 }
