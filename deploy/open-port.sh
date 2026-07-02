@@ -7,17 +7,17 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/.vm-state"
 
 echo "=== Finding security list for the VM's subnet ==="
-VCN_ID=$(oci network subnet get --subnet-id "$SUBNET" \
+VCN_ID=$(oci --profile nemo --auth security_token network subnet get --subnet-id "$SUBNET" \
   --query 'data."vcn-id"' --raw-output)
 
-SEC_LIST_ID=$(oci network security-list list \
+SEC_LIST_ID=$(oci --profile nemo --auth security_token network security-list list \
   --compartment-id "$COMPARTMENT" \
   --vcn-id "$VCN_ID" \
   --query 'data[0].id' --raw-output)
 echo "    Security list: $SEC_LIST_ID"
 
 echo "=== Reading current ingress rules ==="
-CURRENT=$(oci network security-list get \
+CURRENT=$(oci --profile nemo --auth security_token network security-list get \
   --security-list-id "$SEC_LIST_ID" \
   --query 'data."ingress-security-rules"' --raw-output)
 
@@ -50,7 +50,7 @@ else:
 PYEOF
 )
 
-oci network security-list update \
+oci --profile nemo --auth security_token network security-list update \
   --security-list-id "$SEC_LIST_ID" \
   --ingress-security-rules "$UPDATED" \
   --force

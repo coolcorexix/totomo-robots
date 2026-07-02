@@ -1,38 +1,33 @@
 /*
- * WiFi Multi-Config Picker — Totomo Storyteller Box
- * ─────────────────────────────────────────────────
- * On boot the device tries the last-used WiFi automatically.
- * If it fails, a picker appears on the TFT so you can choose
- * another network without reflashing.
+ * Storyteller Box — HS-01
+ * ───────────────────────
+ * WiFi selection is handled by the shared hs01::WifiSelect module:
+ *   auto-connect last network → on-screen picker → "Phone Setup" AP mode
+ *   (WiFiManager captive portal — pick a network from your phone).
+ * After WiFi is up, a Stories/Songs menu leads into an audio player that
+ * streams .mp3 playlists from GitHub.
  *
- * Controls (single button):
- *   Short press  (<1 s)  → cycle to the next network in the list
- *   Long press   (≥1 s)  → connect to the highlighted network
- *   Any press on error   → go back to picker
+ * Controls (single button, GPIO0):
+ *   Category menu — tap: next mode,  hold: select
+ *   Player        — 1x play/pause, 2x next, 3x prev,  hold: back to menu
  *
- * Hardware (matches the storyteller box schematic):
- *   • ESP32-S3
- *   • ST7789 240×240 TFT, SPI (HSPI)
- *       SCLK=21  MOSI=47  DC=40  CS=41  RST=45  BL=42 (backlight)
- *   • Boot button on GPIO0 (active LOW, built-in pull-up)
+ * Hardware: HS-01 (ESP32-S3 + ST7789 SPI TFT + I2S speaker).
  *
- * Required libraries (install via Arduino Library Manager):
- *   • Adafruit ST7735 and ST7789 Library
- *   • Adafruit GFX Library
+ * Build/upload (note the partition + PSRAM flags):
+ *   --fqbn esp32:esp32:esp32s3:PartitionScheme=huge_app,PSRAM=opi
  *
- * ── EDIT SECTION ──────────────────────────────────────────────
- * Only change WIFI_CONFIGS[] and the pin/display constants below.
- * Everything else is self-contained.
+ * Required libraries:
+ *   Adafruit ST7735/ST7789, Adafruit GFX, WiFiManager, ArduinoJson, ESP32-audioI2S
  */
 
 #include <WiFi.h>
-#include <Preferences.h>
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include "Audio.h"
+#include "../shared/hs01_wifi.h"
 
 // ─── Pin & display ────────────────────────────────────────────────────────────
 #define PIN_BTN      0       // Boot button (active LOW)
@@ -56,8 +51,6 @@
 #define I2S_SPK_LRC   16
 
 // ─── Content sources (GitHub) ─────────────────────────────────────────────────
-// Each mode points to a GitHub repo of .mp3 files served via GitHub Pages.
-// Only the owner/repo part of the two URLs differs between entries.
 struct ContentSource {
     const char* name;
     const char* apiUrl;
@@ -79,35 +72,26 @@ const int SOURCE_COUNT = sizeof(SOURCES) / sizeof(SOURCES[0]);
 #define BTN_LONG_MS     1000
 
 // ─── WiFi configs ─────────────────────────────────────────────────────────────
-// Add or remove entries freely. Name is what shows on screen (ASCII only).
-struct WifiConfig {
-    const char* name;
-    const char* ssid;
-    const char* password;
-};
-
-const WifiConfig WIFI_CONFIGS[] = {
-    { "To To Mo",        "To To Mo",   "biethoidehoc"     },
-    { "CT1-1009",  "Nha Meo Va Phat",   "12345678"   },
+const hs01::WifiConfig WIFI_CONFIGS[] = {
+    { "To To Mo",  "To To Mo",         "biethoidehoc" },
+    { "CT1-1009",  "Nha Meo Va Phat",  "12345678"     },
 };
 const int WIFI_COUNT = sizeof(WIFI_CONFIGS) / sizeof(WIFI_CONFIGS[0]);
 
 // ─── Globals ──────────────────────────────────────────────────────────────────
 SPIClass         tftSPI(HSPI);
 Adafruit_ST7789  tft = Adafruit_ST7789(&tftSPI, TFT_CS, TFT_DC, TFT_RST);
-Preferences      prefs;
 Audio            audio;
 
-enum AppScreen { SCR_CONNECTING, SCR_PICKER, SCR_CONNECTED, SCR_ERROR, SCR_CATEGORY, SCR_PLAYER };
-AppScreen screen    = SCR_CONNECTING;
-int       selIdx    = 0;
-int       sourceIdx = 0;   // selected content source (0=Stories, 1=Songs)
-int       catSel    = 0;   // highlighted item in the category menu
+enum AppScreen { SCR_CATEGORY, SCR_PLAYER };
+AppScreen screen    = SCR_CATEGORY;
+int       sourceIdx = 0;
+int       catSel    = 0;
 
-// Button tracking (WiFi picker: short/long press)
-static bool         btnWasPressed = false;
-static unsigned long pressStartMs = 0;
-static bool         longFired     = false;
+// Category-menu button tracking (short/long press)
+static bool          btnWasPressed = false;
+static unsigned long pressStartMs  = 0;
+static bool          longFired     = false;
 
 // Playlist + player state
 String  playlist[MAX_STORIES];
@@ -124,8 +108,10 @@ static int           clickCount      = 0;
 static bool          btnDown         = false;
 static bool          playerLongFired = false;
 
-// ─── Button reader ────────────────────────────────────────────────────────────
-// Returns: 0=nothing  1=short press  2=long press
+// Progress bar — only redrawn when values change, to avoid SPI churn
+static uint32_t lastBarSec = 0xFFFFFFFF;
+
+// ─── Category-menu button reader ──────────────────────────────────────────────
 int readButton() {
     bool pressed = (digitalRead(PIN_BTN) == LOW);
     int  event   = 0;
@@ -134,161 +120,62 @@ int readButton() {
         pressStartMs = millis();
         longFired    = false;
     }
-
     if (pressed && !longFired && (millis() - pressStartMs >= BTN_LONG_MS)) {
         longFired = true;
         event     = 2;
     }
-
     if (!pressed && btnWasPressed && !longFired) {
-        if (millis() - pressStartMs >= BTN_DEBOUNCE_MS) {
-            event = 1;
-        }
+        if (millis() - pressStartMs >= BTN_DEBOUNCE_MS) event = 1;
     }
-
     btnWasPressed = pressed;
     return event;
 }
 
-// ─── Screen drawings ─────────────────────────────────────────────────────────
-void drawConnecting(const char* ssid, int dots) {
-    tft.fillScreen(BG_COLOR);
+// ─── Progress bar (lightweight — only redraws the bar zone) ───────────────────
+void drawProgressBar(uint32_t currentSec, uint32_t totalSec) {
+    // Skip if nothing changed since last frame
+    if (currentSec == lastBarSec) return;
+    lastBarSec = currentSec;
 
-    tft.setTextSize(3);
-    tft.setTextColor(ST77XX_YELLOW);
-    tft.setCursor(10, 18);
-    tft.println("Connecting");
-    tft.drawLine(0, 55, SCREEN_W, 55, ST77XX_WHITE);
+    const int X = 16, Y = 172, W = 208, H = 8;
+    float pct = (totalSec > 0) ? (float)currentSec / totalSec : 0.0f;
+    if (pct > 1.0f) pct = 1.0f;
+    int fillW = (int)(pct * W);
 
-    tft.setTextSize(2);
-    tft.setTextColor(ST77XX_CYAN);
-    tft.setCursor(10, 75);
-    tft.println("SSID:");
-    tft.setTextColor(ST77XX_WHITE);
-    tft.setCursor(10, 100);
-    tft.println(ssid);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%u:%02u / %u:%02u",
+             currentSec / 60, currentSec % 60,
+             totalSec  / 60, totalSec  % 60);
 
-    tft.setTextSize(3);
-    tft.setTextColor(ST77XX_WHITE);
-    tft.setCursor(10, 160);
-    for (int i = 0; i <= dots % 4; i++) tft.print(".");
-}
+    // Erase bar zone (y=148 .. y=198)
+    tft.fillRect(0, 148, SCREEN_W, 52, BG_COLOR);
 
-void drawPicker(int highlight) {
-    tft.fillScreen(BG_COLOR);
-
-    tft.setTextSize(2);
-    tft.setTextColor(ST77XX_YELLOW);
-    tft.setCursor(10, 12);
-    tft.println("Select WiFi:");
-    tft.drawLine(0, 40, SCREEN_W, 40, ST77XX_WHITE);
-
-    // Show up to 4 items
-    const int rowH   = 42;
-    const int startY = 50;
-    int firstVisible = max(0, min(highlight, WIFI_COUNT - 4));
-    for (int i = firstVisible; i < min(firstVisible + 4, WIFI_COUNT); i++) {
-        int row = i - firstVisible;
-        int y   = startY + row * rowH;
-
-        uint16_t nameColor;
-        if (i == highlight) {
-            tft.fillRect(0, y, SCREEN_W, rowH - 4, ST77XX_WHITE);
-            nameColor = ST77XX_BLACK;
-        } else {
-            nameColor = ST77XX_WHITE;
-        }
-
-        tft.setTextSize(2);
-        tft.setTextColor(nameColor);
-        tft.setCursor(8, y + 4);
-        tft.print(i == highlight ? "> " : "  ");
-        tft.print(WIFI_CONFIGS[i].name);
-
-        // SSID hint, smaller, underneath the name
-        tft.setTextSize(1);
-        tft.setTextColor(i == highlight ? ST77XX_BLACK : ST77XX_CYAN);
-        tft.setCursor(28, y + 24);
-        tft.print(WIFI_CONFIGS[i].ssid);
-    }
-
+    // Time label
     tft.setTextSize(1);
-    tft.setTextColor(ST77XX_GREEN);
-    tft.setCursor(8, 226);
-    tft.print("Hold to connect");
-}
-
-void drawConnected(const char* name, const char* ip) {
-    tft.fillScreen(BG_COLOR);
-
-    tft.setTextSize(3);
-    tft.setTextColor(ST77XX_GREEN);
-    tft.setCursor(10, 18);
-    tft.println("Connected!");
-    tft.drawLine(0, 55, SCREEN_W, 55, ST77XX_WHITE);
-
-    tft.setTextSize(2);
     tft.setTextColor(ST77XX_CYAN);
-    tft.setCursor(10, 80);
-    tft.print("WiFi: ");
-    tft.setTextColor(ST77XX_WHITE);
-    tft.println(name);
+    tft.setCursor(16, 153);
+    tft.print(buf);
 
-    tft.setTextColor(ST77XX_CYAN);
-    tft.setCursor(10, 120);
-    tft.println("IP:");
-    tft.setTextColor(ST77XX_WHITE);
-    tft.setCursor(10, 145);
-    tft.println(ip);
-}
-
-void drawError(const char* name) {
-    tft.fillScreen(BG_COLOR);
-
-    tft.setTextSize(3);
-    tft.setTextColor(ST77XX_RED);
-    tft.setCursor(10, 18);
-    tft.println("Failed!");
-    tft.drawLine(0, 55, SCREEN_W, 55, ST77XX_WHITE);
-
-    tft.setTextSize(2);
-    tft.setTextColor(ST77XX_CYAN);
-    tft.setCursor(10, 80);
-    tft.print("WiFi: ");
-    tft.setTextColor(ST77XX_WHITE);
-    tft.println(name);
-
-    tft.setTextSize(2);
-    tft.setTextColor(ST77XX_ORANGE);
-    tft.setCursor(10, 160);
-    tft.println("Press to retry");
-}
-
-// ─── WiFi connect ─────────────────────────────────────────────────────────────
-bool tryConnect(int idx, unsigned long timeoutMs = 12000) {
-    const WifiConfig& cfg = WIFI_CONFIGS[idx];
-    Serial.printf("[WIFI] Connecting to \"%s\" (%s)\n", cfg.name, cfg.ssid);
-
-    WiFi.disconnect(true);
-    delay(100);
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(cfg.ssid, cfg.password);
-
-    unsigned long start = millis();
-    int dots = 0;
-    while (WiFi.status() != WL_CONNECTED) {
-        if (millis() - start > timeoutMs) {
-            Serial.println("[WIFI] Timeout");
-            return false;
-        }
-        drawConnecting(cfg.ssid, dots++);
-        delay(250);
+    // Bar frame
+    tft.drawRect(X, Y, W, H, ST77XX_WHITE);
+    if (fillW > 0) {
+        uint16_t barColor = (pct >= 0.95f) ? ST77XX_GREEN : ST77XX_CYAN;
+        tft.fillRect(X + 1, Y + 1, fillW - 2, H - 2, barColor);
     }
-    return true;
+
+    // Percentage badge at right end
+    snprintf(buf, sizeof(buf), "%d%%", (int)(pct * 100));
+    tft.setTextSize(1);
+    tft.setTextColor(ST77XX_YELLOW);
+    tft.setCursor(200, 153);
+    tft.print(buf);
 }
 
-// ─── Storyteller: player screen ───────────────────────────────────────────────
+// ─── Player screen (full redraw on state change) ──────────────────────────────
 void drawPlayer(const String& title, const String& status, const String& instruction) {
+    // Erase stale bar on full redraw, reset tracker so next loop() redraws it
+    lastBarSec = 0xFFFFFFFF;
+
     tft.fillScreen(BG_COLOR);
 
     tft.setTextSize(3);
@@ -312,6 +199,9 @@ void drawPlayer(const String& title, const String& status, const String& instruc
     String t = title;
     if (t.length() > 18) t = t.substring(0, 15) + "...";
     tft.println(t);
+
+    // Clear the progress-bar zone on full redraws
+    tft.fillRect(0, 148, SCREEN_W, 52, BG_COLOR);
 
     tft.setTextSize(2);
     tft.setTextColor(ST77XX_ORANGE);
@@ -341,7 +231,7 @@ void fetchPlaylist() {
                     totalStories++;
                 }
             }
-            Serial.printf("[STORY] Loaded %d stories\n", totalStories);
+            Serial.printf("[STORY] Loaded %d items\n", totalStories);
         } else {
             Serial.printf("[STORY] JSON parse error: %s\n", err.c_str());
         }
@@ -349,11 +239,11 @@ void fetchPlaylist() {
     http.end();
 }
 
-// ─── Storyteller: play current story ──────────────────────────────────────────
+// ─── Storyteller: play current item ───────────────────────────────────────────
 void playStory() {
     if (totalStories == 0) {
-        Serial.println("[STORY] No stories loaded");
-        drawPlayer("No stories", "Load failed", "1x: Retry");
+        Serial.println("[STORY] No items loaded");
+        drawPlayer("No items", "Load failed", "1x: Retry");
         return;
     }
     Serial.printf("[STORY] Playing: %s\n", playlist[currentStory].c_str());
@@ -401,7 +291,6 @@ void drawCategory(int highlight) {
 void enterCategory() {
     screen = SCR_CATEGORY;
     catSel = 0;
-    // Require a fresh press: ignore a button (or serial DTR line) still held low
     btnWasPressed = true;
     longFired     = true;
     drawCategory(catSel);
@@ -417,7 +306,6 @@ void startPlayer() {
     isPlaying       = false;
     audioWasRunning = false;
     clickCount      = 0;
-    // Swallow the select-hold so the player button ignores this in-progress press
     btnDown         = true;
     playerLongFired = true;
     lastPressMs     = millis();
@@ -439,7 +327,6 @@ void backToCategory() {
     isPlaying       = false;
     audioWasRunning = false;
     clickCount      = 0;
-    // Swallow the in-progress hold so readButton() in the menu ignores it
     btnWasPressed = true;
     longFired     = true;
     screen = SCR_CATEGORY;
@@ -452,21 +339,18 @@ void handlePlayerButton() {
     unsigned long now = millis();
     bool pressed = (digitalRead(PIN_BTN) == LOW);
 
-    // Press edge
     if (pressed && !btnDown) {
         btnDown         = true;
         lastPressMs     = now;
         playerLongFired = false;
     }
 
-    // Hold ≥ BTN_LONG_MS → back to category menu
     if (pressed && btnDown && !playerLongFired && (now - lastPressMs >= BTN_LONG_MS)) {
         playerLongFired = true;
         backToCategory();
         return;
     }
 
-    // Release edge → register a click (unless this was a long press)
     if (!pressed && btnDown) {
         btnDown = false;
         if (!playerLongFired && (now - lastPressMs >= BTN_DEBOUNCE_MS)) {
@@ -475,11 +359,10 @@ void handlePlayerButton() {
         }
     }
 
-    // Resolve the click count once the multi-click gap has elapsed
     if (clickCount > 0 && !btnDown && (now - lastReleaseMs > 450)) {
         if (clickCount == 1) {
             if (totalStories == 0) {
-                startPlayer();              // retry loading this source
+                startPlayer();
                 return;
             } else if (!isPlaying && !audio.isRunning()) {
                 playStory();
@@ -505,54 +388,29 @@ void handlePlayerButton() {
 void setup() {
     Serial.begin(115200);
     delay(300);
-    Serial.println("\n=== Totomo WiFi Picker ===");
+    Serial.println("\n=== HS-01 Storyteller ===");
 
     pinMode(PIN_BTN, INPUT_PULLUP);
 
-    // Backlight ON first — without this the screen stays dark
     pinMode(TFT_BL, OUTPUT);
     digitalWrite(TFT_BL, HIGH);
 
     tftSPI.begin(TFT_SCLK, -1, TFT_MOSI, -1);
     tft.init(SCREEN_W, SCREEN_H, SPI_MODE3);
-    tft.setRotation(0);   // flipped 180° (upside down) vs. default
+    tft.setRotation(0);
     tft.fillScreen(BG_COLOR);
 
-    // Restore last-used index from flash
-    prefs.begin("wifi", true);   // read-only
-    selIdx = prefs.getInt("lastIdx", 0);
-    prefs.end();
-    if (selIdx < 0 || selIdx >= WIFI_COUNT) selIdx = 0;
+    hs01::WifiSelect wifi(tft, PIN_BTN, WIFI_CONFIGS, WIFI_COUNT, BG_COLOR);
+    wifi.connect();
 
-    Serial.printf("[WIFI] Auto-trying last config: %s\n", WIFI_CONFIGS[selIdx].ssid);
-    if (tryConnect(selIdx, 8000)) {
-        // Save (in case order changed since last boot)
-        prefs.begin("wifi", false);
-        prefs.putInt("lastIdx", selIdx);
-        prefs.end();
-
-        String ip = WiFi.localIP().toString();
-        Serial.printf("[WIFI] Connected! IP=%s\n", ip.c_str());
-        drawConnected(WIFI_CONFIGS[selIdx].name, ip.c_str());
-        delay(1500);
-
-        // ── Show the content-mode menu (Stories / Songs) ──────────────────
-        enterCategory();
-        return;
-    }
-
-    Serial.println("[WIFI] Auto-connect failed — showing picker");
-    screen = SCR_PICKER;
-    drawPicker(selIdx);
+    enterCategory();
 }
 
 // ─── loop ─────────────────────────────────────────────────────────────────────
 void loop() {
-    // ── Storyteller running — audio + playback controls ──────────────────────
     if (screen == SCR_PLAYER) {
         audio.loop();
 
-        // Auto-advance when a story finishes playing
         bool running = audio.isRunning();
         if (isPlaying && audioWasRunning && !running && totalStories > 0) {
             currentStory = (currentStory + 1) % totalStories;
@@ -560,60 +418,26 @@ void loop() {
         }
         audioWasRunning = running;
 
+        // Progress bar — lightweight per-frame update (only redraws if changed)
+        if (isPlaying && running) {
+            uint32_t cur = audio.getAudioCurrentTime();
+            uint32_t dur = audio.getAudioFileDuration();
+            if (dur > 0) drawProgressBar(cur, dur);
+        }
+
         handlePlayerButton();
         return;
     }
 
     int btn = readButton();
-
-    if (screen == SCR_PICKER) {
+    if (screen == SCR_CATEGORY) {
         if (btn == 1) {
-            // Short press: advance selection
-            selIdx = (selIdx + 1) % WIFI_COUNT;
-            Serial.printf("[BTN] Highlighted: %s\n", WIFI_CONFIGS[selIdx].name);
-            drawPicker(selIdx);
-
-        } else if (btn == 2) {
-            // Long press: connect to highlighted config
-            Serial.printf("[BTN] Connecting to: %s\n", WIFI_CONFIGS[selIdx].ssid);
-            screen = SCR_CONNECTING;
-
-            if (tryConnect(selIdx, 15000)) {
-                prefs.begin("wifi", false);
-                prefs.putInt("lastIdx", selIdx);
-                prefs.end();
-
-                String ip = WiFi.localIP().toString();
-                Serial.printf("[WIFI] Connected! IP=%s\n", ip.c_str());
-                drawConnected(WIFI_CONFIGS[selIdx].name, ip.c_str());
-                delay(1500);
-
-                // ── Show the content-mode menu (Stories / Songs) ──────────
-                enterCategory();
-            } else {
-                Serial.printf("[WIFI] Failed to connect to %s\n", WIFI_CONFIGS[selIdx].ssid);
-                screen = SCR_ERROR;
-                drawError(WIFI_CONFIGS[selIdx].name);
-            }
-        }
-
-    } else if (screen == SCR_CATEGORY) {
-        if (btn == 1) {
-            // Short press: highlight next mode
             catSel = (catSel + 1) % SOURCE_COUNT;
             drawCategory(catSel);
         } else if (btn == 2) {
-            // Long press: select this mode and load it
             sourceIdx = catSel;
             Serial.printf("[MODE] Selected: %s\n", SOURCES[sourceIdx].name);
             startPlayer();
-        }
-
-    } else if (screen == SCR_ERROR) {
-        if (btn != 0) {
-            // Any button press → back to picker
-            screen = SCR_PICKER;
-            drawPicker(selIdx);
         }
     }
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # create-vm.sh — create the Always Free ARM VM on Oracle Cloud.
-# Run ONCE after `oci setup config` is done.
+# Run ONCE after `oci --profile nemo --auth security_token setup config` is done.
 # Saves VM details to .vm-state for use by other scripts.
 
 set -euo pipefail
@@ -10,18 +10,18 @@ SSH_KEY="$HOME/.ssh/coolcoreexix_rsa.pub"
 DISPLAY_NAME="totomo-voice"
 
 echo "=== [1/5] Resolving tenancy and compartment ==="
-TENANCY=$(oci iam account get --query 'data."tenancy-id"' --raw-output)
+TENANCY=$(oci --profile nemo --auth security_token iam account get --query 'data."tenancy-id"' --raw-output)
 COMPARTMENT="$TENANCY"   # root compartment = tenancy for new accounts
 echo "    Tenancy: $TENANCY"
 
 echo "=== [2/5] Finding availability domain ==="
-AD=$(oci iam availability-domain list \
+AD=$(oci --profile nemo --auth security_token iam availability-domain list \
   --compartment-id "$COMPARTMENT" \
   --query 'data[0].name' --raw-output)
 echo "    AD: $AD"
 
 echo "=== [3/5] Finding Ubuntu 22.04 ARM image ==="
-IMAGE=$(oci compute image list \
+IMAGE=$(oci --profile nemo --auth security_token compute image list \
   --compartment-id "$COMPARTMENT" \
   --operating-system "Canonical Ubuntu" \
   --operating-system-version "22.04" \
@@ -31,13 +31,13 @@ IMAGE=$(oci compute image list \
 echo "    Image: $IMAGE"
 
 echo "=== [4/5] Finding default subnet ==="
-SUBNET=$(oci network subnet list \
+SUBNET=$(oci --profile nemo --auth security_token network subnet list \
   --compartment-id "$COMPARTMENT" \
   --query 'data[0].id' --raw-output)
 echo "    Subnet: $SUBNET"
 
 echo "=== [5/5] Launching VM (4 OCPU, 24 GB RAM) ==="
-INSTANCE_ID=$(oci compute instance launch \
+INSTANCE_ID=$(oci --profile nemo --auth security_token compute instance launch \
   --compartment-id "$COMPARTMENT" \
   --availability-domain "$AD" \
   --shape "VM.Standard.A1.Flex" \
@@ -54,14 +54,14 @@ echo "    Instance ID: $INSTANCE_ID"
 echo ""
 echo "Waiting for VM to reach RUNNING state..."
 while true; do
-  LIFECYCLE=$(oci compute instance get --instance-id "$INSTANCE_ID" \
+  LIFECYCLE=$(oci --profile nemo --auth security_token compute instance get --instance-id "$INSTANCE_ID" \
     --query 'data."lifecycle-state"' --raw-output)
   echo "  → $LIFECYCLE"
   [ "$LIFECYCLE" = "RUNNING" ] && break
   sleep 10
 done
 
-PUBLIC_IP=$(oci compute instance list-vnics \
+PUBLIC_IP=$(oci --profile nemo --auth security_token compute instance list-vnics \
   --instance-id "$INSTANCE_ID" \
   --compartment-id "$COMPARTMENT" \
   --query 'data[0]."public-ip"' --raw-output)
