@@ -19,19 +19,21 @@
 #include <Adafruit_ST7789.h>
 
 #include "config.h"
-#include "../shared/hs01_wifi.h"
+#include "hs01_wifi.h"
 
 /* ── Display ───────────────────────────────────────────────────── */
-static Adafruit_ST7789 tft(PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST);
+#include <SPI.h>
+static SPIClass tftSPI(HSPI);
+static Adafruit_ST7789 tft(&tftSPI, TFT_CS, TFT_DC, TFT_RST);
 
 static void tft_init() {
-    tft.init(240, 240);
-    tft.setRotation(0);
-    tft.fillScreen(TFT_BG);
+    pinMode(TFT_BL, OUTPUT);
+    digitalWrite(TFT_BL, HIGH);
+    tftSPI.begin(TFT_SCLK, -1, TFT_MOSI, -1);
+    tft.init(240, 240, SPI_MODE3);
 }
 
 static void tft_header(const char* title, uint16_t color = ST77XX_GREEN) {
-    tft.fillScreen(TFT_BG);
     tft.setTextSize(3);
     tft.setTextColor(color);
     tft.setCursor(10, 30);
