@@ -30,9 +30,13 @@
 #define PIN_MIC_SCK     5
 #define PIN_MIC_SD      6
 
-#define PIN_SPK_BCLK    7
-#define PIN_SPK_LRC    15
-#define PIN_SPK_DIN    16
+// NOTE: matches the corrected HS01_HARDWARE.md pinout (verified on real
+// hardware, storyteller.ino) — this file previously had BCLK/DIN swapped,
+// which produces total silence with zero errors logged (decode succeeds
+// fine — the bug is purely in which physical pin gets which I2S signal).
+#define PIN_SPK_DIN     7
+#define PIN_SPK_BCLK   15
+#define PIN_SPK_LRC    16
 
 // ── Audio ────────────────────────────────────────────────────────
 #define MIC_SAMPLE_RATE     16000

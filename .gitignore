@@ -8,3 +8,5 @@
 **/.env
 
 .DS_Store
+HS-01/**/build/
+HS-01/**/.pio/
