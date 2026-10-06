@@ -104,7 +104,14 @@ static void face_tick() {
 }
 
 // Caption strip under the eyes: line1 in color, line2 small (e.g. reply text).
-static void tft_status(const char* line1, const char* line2, uint16_t c1 = ST77XX_WHITE) {
+// While a number card is up (CARD_HOLD_MS), captions are remembered instead and
+// the latest one is drawn when the card expires.
+static unsigned long cardUntil = 0;
+static bool          pendValid = false;
+static char          pendL1[32], pendL2[96];
+static uint16_t      pendColor = ST77XX_WHITE;
+
+static void draw_caption(const char* line1, const char* line2, uint16_t c1) {
     tft.fillRect(0, FACE_MAX_Y, 240, 240 - FACE_MAX_Y, ST77XX_BLACK);
     tft.setTextWrap(false);
     tft.setTextSize(2);
@@ -118,6 +125,43 @@ static void tft_status(const char* line1, const char* line2, uint16_t c1 = ST77X
         tft.print(line2);
     }
     tft.setTextWrap(true);
+}
+
+static void tft_status(const char* line1, const char* line2, uint16_t c1 = ST77XX_WHITE) {
+    if (cardUntil && (long)(millis() - cardUntil) < 0) {
+        strlcpy(pendL1, line1 ? line1 : "", sizeof(pendL1));
+        strlcpy(pendL2, line2 ? line2 : "", sizeof(pendL2));
+        pendColor = c1;
+        pendValid = true;
+        return;
+    }
+    draw_caption(line1, line2, c1);
+}
+
+// A number the robot is talking about, big: "BTC 22:44  2.24B VND" / "$86,160".
+static void tft_card(const char* title, const char* value, const char* detail) {
+    tft.fillRect(0, FACE_MAX_Y, 240, 240 - FACE_MAX_Y, ST77XX_BLACK);
+    tft.setTextWrap(false);
+    tft.setTextSize(1);
+    tft.setTextColor(ST77XX_CYAN);
+    tft.setCursor(8, FACE_MAX_Y + 2);
+    tft.print(title);
+    if (title[0] && detail[0]) tft.print("  ");
+    tft.setTextColor(ST77XX_WHITE);
+    tft.print(detail);
+    tft.setTextSize(3);
+    tft.setTextColor(ST77XX_YELLOW);
+    tft.setCursor(8, FACE_MAX_Y + 14);
+    tft.print(value);
+    tft.setTextWrap(true);
+    cardUntil = millis() + CARD_HOLD_MS;
+    if (!cardUntil) cardUntil = 1;
+}
+
+static void card_tick() {
+    if (!cardUntil || (long)(millis() - cardUntil) < 0) return;
+    cardUntil = 0;
+    if (pendValid) { pendValid = false; draw_caption(pendL1, pendL2, pendColor); }
 }
 
 /* ── State machine ──────────────────────────────────────────────── */
@@ -316,6 +360,11 @@ static void on_ws(WStype_t t, uint8_t* payload, size_t len) {
             face_set(FACE_CONFUSED);
             tft_status(st, msg, ST77XX_RED);
 
+        } else if (!strcmp(mt, "display")) {
+            // A number the reply is about (price, temperature, result).
+            tft_card(d["title"] | "", d["value"] | "", d["detail"] | "");
+            Serial.printf("[CARD] %s %s %s\n", d["title"] | "", d["value"] | "", d["detail"] | "");
+
         } else if (!strcmp(mt, "conversation")) {
             // The user said goodbye: the server ended the conversation after
             // the goodbye played. Back to standby until the next tap.
@@ -471,6 +520,7 @@ void loop() {
     ws.loop();
     handle_button();
     face_tick();
+    card_tick();
     if (convo) {
         stream_mic(state == LISTENING && (long)(millis() - micResumeAt) >= 0);
         if (state == LISTENING && millis() - convoActiveAt > CONVO_IDLE_MS)

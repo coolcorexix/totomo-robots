@@ -31,6 +31,7 @@
 
 #define TFT_BG         0x0014      // navy blue
 #define FACE_MAX_Y     196         // Otto eyes stay above this; caption strip below
+#define CARD_HOLD_MS   12000       // a number card stays this long under the eyes
 
 #define PIN_MIC_WS      4
 #define PIN_MIC_SCK     5
