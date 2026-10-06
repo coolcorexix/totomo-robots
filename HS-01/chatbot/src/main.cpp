@@ -313,16 +313,26 @@ static void handle_button() {
 }
 
 /* ── Mic streaming ──────────────────────────────────────────────── */
+// INMP441 sends 24-bit samples MSB-aligned in 32-bit words, with a large DC
+// offset that drifts between turns. Take the 24-bit value, strip DC with a
+// one-pole high-pass, apply MIC_GAIN and saturate. (The old `raw >> 11` was
+// x32 on top of the DC offset, so int16 wrapped around into noise.)
 static int32_t micRaw[MIC_FRAME_SAMPLES];
 static int16_t micPcm[MIC_FRAME_SAMPLES];
+static float   hpPrevIn = 0, hpPrevOut = 0;
 
 static void stream_mic() {
     size_t nr = 0;
     if (i2s_read(I2S_NUM_0, micRaw, sizeof(micRaw), &nr, 0) != ESP_OK || nr == 0)
         return;
     int n = nr / 4;
-    for (int i = 0; i < n; i++)
-        micPcm[i] = (int16_t)(micRaw[i] >> 11);
+    for (int i = 0; i < n; i++) {
+        float x = (float)(micRaw[i] >> 8);                  // 24-bit sample
+        float y = MIC_HPF_A * (hpPrevOut + x - hpPrevIn);   // DC blocker
+        hpPrevIn = x; hpPrevOut = y;
+        float v = y * (MIC_GAIN / 256.0f);                  // 24 -> 16 bit, x gain
+        micPcm[i] = (int16_t)(v > 32767.f ? 32767.f : v < -32768.f ? -32768.f : v);
+    }
     ws.sendBIN((const uint8_t*)micPcm, n * sizeof(int16_t));
 }
 

@@ -47,6 +47,8 @@
 #define MIC_SAMPLE_RATE     16000
 #define MIC_FRAME_MS        60
 #define MIC_FRAME_SAMPLES   (MIC_SAMPLE_RATE * MIC_FRAME_MS / 1000)
+#define MIC_GAIN            2.0f      // on top of 24->16 bit; ~-21..-28 dBFS speech
+#define MIC_HPF_A           0.9615f   // DC blocker, exp(-2*pi*100Hz/16kHz)
 #define TTS_SAMPLE_RATE     24000
 #define TTS_FRAME_MS        60
 #define TTS_FRAME_SAMPLES   (TTS_SAMPLE_RATE * TTS_FRAME_MS / 1000)
