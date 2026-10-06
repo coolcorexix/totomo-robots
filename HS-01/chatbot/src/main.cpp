@@ -256,6 +256,16 @@ static void on_ws(WStype_t t, uint8_t* payload, size_t len) {
             convo = false;   // the server ended the conversation
             tft_status(st, msg, ST77XX_RED);
 
+        } else if (!strcmp(mt, "conversation")) {
+            // The user said goodbye: the server ended the conversation after
+            // the goodbye played. Back to standby until the next tap.
+            if (!strcmp(d["state"] | "", "end")) {
+                convo = false;
+                state = IDLE;
+                show_standby();
+                Serial.println("[CONVO] off (goodbye)");
+            }
+
         } else if (!strcmp(mt, "llm")) {
             Serial.printf("[LLM] %s\n", d["text"] | "");
 
