@@ -158,6 +158,11 @@ Sample rate we use for voice: **16000 Hz**.
   ```
 - **Gotcha:** flashing/serial resets toggle GPIO0 and can look like a held press.
   On a menu screen, require a *fresh* press (wait for release first) before acting.
+- **Gotcha (legacy `driver/i2s.h`):** always set `.mck_io_num = I2S_PIN_NO_CHANGE`
+  in `i2s_pin_config_t`. It is the struct's first field; leaving it out makes it
+  `0` = **GPIO0**, so `i2s_set_pin()` turns the button into the I2S master-clock
+  output. Symptom: a phantom "press" right after boot, then the button never
+  responds again.
 
 ---
 

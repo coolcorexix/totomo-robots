@@ -94,6 +94,7 @@ static void i2s_mic_init() {
         .fixed_mclk           = 0,
     };
     i2s_pin_config_t pins = {
+        .mck_io_num   = I2S_PIN_NO_CHANGE,  // left at 0 it hijacks GPIO0 = the button
         .bck_io_num   = PIN_MIC_SCK, .ws_io_num      = PIN_MIC_WS,
         .data_out_num = I2S_PIN_NO_CHANGE,
         .data_in_num  = PIN_MIC_SD,
@@ -119,6 +120,7 @@ static void i2s_spk_init() {
         .fixed_mclk           = 0,
     };
     i2s_pin_config_t pins = {
+        .mck_io_num   = I2S_PIN_NO_CHANGE,  // left at 0 it hijacks GPIO0 = the button
         .bck_io_num   = PIN_SPK_BCLK, .ws_io_num      = PIN_SPK_LRC,
         .data_out_num = PIN_SPK_DIN,
         .data_in_num  = I2S_PIN_NO_CHANGE,
@@ -267,10 +269,13 @@ static void on_ws(WStype_t t, uint8_t* payload, size_t len) {
 static bool          pttActive    = false;
 static bool          btnPrev      = HIGH;
 static bool          swallowPress = false;  // this press was used to interrupt
+static bool          btnArmed     = false;  // seen released since boot
 static unsigned long btnPressAt   = 0;
 
 static void handle_button() {
     bool cur = digitalRead(PIN_BTN);
+    if (cur == HIGH) btnArmed = true;   // resets can leave GPIO0 low at boot
+    if (!btnArmed) { btnPrev = cur; return; }
 
     // A turn can end without a release (disconnect, server stop): never let a
     // stale pttActive block the next press.
