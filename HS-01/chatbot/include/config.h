@@ -1,8 +1,13 @@
 #pragma once
 
-// Fly.io voice server
+// Voice server: Fly.io by default; the `local` PlatformIO env overrides these
+// to point at a server on the LAN (see platformio.ini).
+#ifndef SERVER_HOST
 #define SERVER_HOST     "totomo-voice.fly.dev"
+#endif
+#ifndef SERVER_PORT
 #define SERVER_PORT     80
+#endif
 #define DEVICE_ID       "hs01-chatbot-01"
 #define CLIENT_ID       "hs01-chatbot-01"
 
