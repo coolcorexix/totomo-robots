@@ -316,7 +316,7 @@ void setup() {
     delay(500);
     Serial.println("\n════════════════════════════");
     Serial.println("  HS-01 Chatbot");
-    Serial.println("  server  totomo-voice.fly.dev:80");
+    Serial.printf("  server  %s:%d\n", SERVER_HOST, SERVER_PORT);
     Serial.println("════════════════════════════");
 
     pinMode(PIN_BTN, INPUT_PULLUP);
