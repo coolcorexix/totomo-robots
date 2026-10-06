@@ -225,6 +225,15 @@ static void on_ws(WStype_t t, uint8_t* payload, size_t len) {
                 state = PROCESSING;
             }
 
+        } else if (!strcmp(mt, "alert")) {
+            // Server-side failure (e.g. OpenAI out of credits): show the reason
+            // and stay idle so the next press retries.
+            const char* st  = d["status"]  | "Error";
+            const char* msg = d["message"] | "";
+            Serial.printf("[ALERT] %s: %s\n", st, msg);
+            state = IDLE;
+            tft_status(st, msg, ST77XX_RED);
+
         } else if (!strcmp(mt, "llm")) {
             Serial.printf("[LLM] %s\n", d["text"] | "");
 
