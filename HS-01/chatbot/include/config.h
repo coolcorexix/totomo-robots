@@ -30,6 +30,7 @@
 #define TFT_RST        45
 
 #define TFT_BG         0x0014      // navy blue
+#define FACE_MAX_Y     196         // Otto eyes stay above this; caption strip below
 
 #define PIN_MIC_WS      4
 #define PIN_MIC_SCK     5

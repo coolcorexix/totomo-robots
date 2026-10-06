@@ -17,9 +17,11 @@
 #include <opus.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
+#include <AnimatedGIF.h>
 
 #include "config.h"
 #include "hs01_wifi.h"
+#include "otto_gifs.h"
 
 /* ── Display ───────────────────────────────────────────────────── */
 #include <SPI.h>
@@ -41,32 +43,81 @@ static void tft_header(const char* title, uint16_t color = ST77XX_GREEN) {
     tft.drawLine(0, 80, 240, 80, ST77XX_WHITE);
 }
 
-static void tft_connection(const char* ip) {
-    tft.setTextSize(2);
-    tft.setTextColor(ST77XX_CYAN);
-    tft.setCursor(10, 110);
-    tft.println("IP:");
-    tft.setTextColor(ST77XX_WHITE);
-    tft.setCursor(10, 140);
-    tft.println(ip);
-    tft.setTextSize(2);
-    tft.setTextColor(ST77XX_WHITE);
-    tft.setCursor(10, 180);
-    tft.println("Tap BTN to talk");
+/* ── Face: Otto eyes ───────────────────────────────────────────── */
+// Animated 240x240 GIFs (mascot/otto) drawn line by line straight to the TFT,
+// one frame per loop() pass at the GIF's own pace (~12.5 fps). The eyes never
+// go below FACE_MAX_Y, so the strip under them is kept for a caption.
+enum Face { FACE_NEUTRAL, FACE_SURPRISED, FACE_THINKING, FACE_HAPPY, FACE_SAD, FACE_CONFUSED };
+
+static AnimatedGIF   gif;
+static Face          curFace     = FACE_NEUTRAL;
+static bool          faceOpen    = false;
+static unsigned long nextFrameAt = 0;
+static uint16_t      faceLine[240];
+
+static void face_draw_line(GIFDRAW* p) {
+    int y = p->iY + p->y;
+    if (y >= FACE_MAX_Y) return;
+    int w = p->iWidth;
+    if (p->iX + w > 240) w = 240 - p->iX;
+    if (w <= 0) return;
+    uint8_t*  px  = p->pPixels;
+    uint16_t* pal = p->pPalette;
+    if (p->ucDisposalMethod == 2) {             // restore to background
+        for (int x = 0; x < w; x++)
+            if (px[x] == p->ucTransparent) px[x] = p->ucBackground;
+        p->ucHasTransparency = 0;
+    }
+    tft.startWrite();
+    if (p->ucHasTransparency) {                  // only draw opaque runs
+        uint8_t t = p->ucTransparent;
+        for (int x = 0; x < w;) {
+            while (x < w && px[x] == t) x++;
+            int start = x, n = 0;
+            while (x < w && px[x] != t) faceLine[n++] = pal[px[x++]];
+            if (n) { tft.setAddrWindow(p->iX + start, y, n, 1); tft.writePixels(faceLine, n); }
+        }
+    } else {
+        for (int x = 0; x < w; x++) faceLine[x] = pal[px[x]];
+        tft.setAddrWindow(p->iX, y, w, 1);
+        tft.writePixels(faceLine, w);
+    }
+    tft.endWrite();
 }
 
+static void face_set(Face f) {
+    if (faceOpen && f == curFace) return;
+    if (faceOpen) gif.close();
+    faceOpen = gif.open((uint8_t*)OTTO_GIFS[f].data, (int)OTTO_GIFS[f].len, face_draw_line);
+    curFace = f;
+    tft.fillRect(0, 0, 240, FACE_MAX_Y, ST77XX_BLACK);
+    nextFrameAt = 0;
+}
+
+static void face_tick() {
+    if (!faceOpen || (long)(millis() - nextFrameAt) < 0) return;
+    int delayMs = 0;
+    // Measured on HS-01: ~8-15 ms per frame, 48 ms worst case, well inside the
+    // 170 ms speaker DMA buffer, so audio doesn't stutter.
+    if (!gif.playFrame(false, &delayMs)) gif.reset();   // loop the animation
+    nextFrameAt = millis() + (delayMs > 0 ? delayMs : 80);
+}
+
+// Caption strip under the eyes: line1 in color, line2 small (e.g. reply text).
 static void tft_status(const char* line1, const char* line2, uint16_t c1 = ST77XX_WHITE) {
-    tft.fillRect(0, 100, 240, 140, TFT_BG);
+    tft.fillRect(0, FACE_MAX_Y, 240, 240 - FACE_MAX_Y, ST77XX_BLACK);
+    tft.setTextWrap(false);
     tft.setTextSize(2);
     tft.setTextColor(c1);
-    tft.setCursor(10, 110);
-    tft.println(line1);
+    tft.setCursor(8, FACE_MAX_Y + 4);
+    tft.print(line1);
     if (line2 && line2[0]) {
         tft.setTextSize(1);
         tft.setTextColor(ST77XX_CYAN);
-        tft.setCursor(10, 145);
-        tft.println(line2);
+        tft.setCursor(8, FACE_MAX_Y + 26);
+        tft.print(line2);
     }
+    tft.setTextWrap(true);
 }
 
 /* ── State machine ──────────────────────────────────────────────── */
@@ -79,8 +130,14 @@ static bool          convo         = false;
 static unsigned long convoActiveAt = 0;   // last speech activity (idle timeout)
 static unsigned long micResumeAt   = 0;   // guard after speaking (speaker tail)
 
-static void show_standby() { tft_status("Online", "Tap BTN to talk", ST77XX_GREEN); }
-static void show_listening() { tft_status("Listening...", "just talk", ST77XX_ORANGE); }
+static void show_standby() {
+    face_set(FACE_NEUTRAL);
+    tft_status("Online", "Tap BTN to talk", ST77XX_GREEN);
+}
+static void show_listening() {
+    face_set(FACE_SURPRISED);
+    tft_status("Listening...", "just talk", ST77XX_ORANGE);
+}
 
 static void resume_listening() {
     state         = LISTENING;
@@ -219,6 +276,7 @@ static void on_ws(WStype_t t, uint8_t* payload, size_t len) {
         sessionId  = "";
         state      = IDLE;
         convo      = false;
+        face_set(FACE_SAD);
         tft_status("Offline", "reconnecting...", ST77XX_RED);
         Serial.println("[WS] closed");
         break;
@@ -241,6 +299,7 @@ static void on_ws(WStype_t t, uint8_t* payload, size_t len) {
             const char* txt = d["text"] | "";
             if (txt[0] && txt[0] != '%') {
                 Serial.printf("[STT] %s\n", txt);
+                face_set(FACE_THINKING);
                 tft_status("Thinking...", txt, ST77XX_YELLOW);
                 state = PROCESSING;
                 convoActiveAt = millis();
@@ -254,6 +313,7 @@ static void on_ws(WStype_t t, uint8_t* payload, size_t len) {
             Serial.printf("[ALERT] %s: %s\n", st, msg);
             state = IDLE;
             convo = false;   // the server ended the conversation
+            face_set(FACE_CONFUSED);
             tft_status(st, msg, ST77XX_RED);
 
         } else if (!strcmp(mt, "conversation")) {
@@ -273,6 +333,7 @@ static void on_ws(WStype_t t, uint8_t* payload, size_t len) {
             const char* s = d["state"] | "";
             if (!strcmp(s, "start")) {
                 state = SPEAKING;
+                face_set(FACE_HAPPY);
                 convoActiveAt = millis();
             } else if (!strcmp(s, "sentence_start")) {
                 Serial.printf("[TTS] %s\n", d["text"] | "");
@@ -389,8 +450,10 @@ void setup() {
                           sizeof(WIFI_LIST)/sizeof(WIFI_LIST[0]), TFT_BG);
     wifi.connect();
 
-    tft_header("Chatbot");
-    tft_connection(WiFi.localIP().toString().c_str());
+    gif.begin(GIF_PALETTE_RGB565_LE);
+    tft.fillScreen(ST77XX_BLACK);
+    face_set(FACE_NEUTRAL);
+    tft_status("Connecting...", WiFi.localIP().toString().c_str(), ST77XX_WHITE);
 
     String path = "/xiaozhi/v1/?device-id=";
     path += DEVICE_ID;
@@ -407,6 +470,7 @@ void setup() {
 void loop() {
     ws.loop();
     handle_button();
+    face_tick();
     if (convo) {
         stream_mic(state == LISTENING && (long)(millis() - micResumeAt) >= 0);
         if (state == LISTENING && millis() - convoActiveAt > CONVO_IDLE_MS)
