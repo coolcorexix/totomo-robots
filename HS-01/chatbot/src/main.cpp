@@ -52,7 +52,7 @@ static void tft_connection(const char* ip) {
     tft.setTextSize(2);
     tft.setTextColor(ST77XX_WHITE);
     tft.setCursor(10, 180);
-    tft.println("Hold BTN to talk");
+    tft.println("Tap BTN to talk");
 }
 
 static void tft_status(const char* line1, const char* line2, uint16_t c1 = ST77XX_WHITE) {
@@ -72,6 +72,22 @@ static void tft_status(const char* line1, const char* line2, uint16_t c1 = ST77X
 /* ── State machine ──────────────────────────────────────────────── */
 enum State { IDLE, LISTENING, PROCESSING, SPEAKING };
 static State state = IDLE;
+
+// Conversation mode: one tap starts hands-free listening and the server finds
+// each turn. The mic is muted while the robot speaks so it can't hear itself.
+static bool          convo         = false;
+static unsigned long convoActiveAt = 0;   // last speech activity (idle timeout)
+static unsigned long micResumeAt   = 0;   // guard after speaking (speaker tail)
+
+static void show_standby() { tft_status("Online", "Tap BTN to talk", ST77XX_GREEN); }
+static void show_listening() { tft_status("Listening...", "just talk", ST77XX_ORANGE); }
+
+static void resume_listening() {
+    state         = LISTENING;
+    micResumeAt   = millis() + MIC_RESUME_MS;
+    convoActiveAt = millis();
+    show_listening();
+}
 
 /* ── WebSocket ──────────────────────────────────────────────────── */
 static WebSocketsClient ws;
@@ -172,11 +188,11 @@ static void ws_hello() {
     ws_emit(d);
 }
 
-static void ws_listen(const char* st) {
+static void ws_listen(const char* st, const char* mode = "manual") {
     StaticJsonDocument<128> d;
     d["type"]       = "listen";
     d["state"]      = st;
-    d["mode"]       = "manual";
+    d["mode"]       = mode;
     d["session_id"] = sessionId;
     ws_emit(d);
 }
@@ -202,7 +218,8 @@ static void on_ws(WStype_t t, uint8_t* payload, size_t len) {
         helloAcked = false;
         sessionId  = "";
         state      = IDLE;
-        tft_status("Offline", "reconnecting…", ST77XX_RED);
+        convo      = false;
+        tft_status("Offline", "reconnecting...", ST77XX_RED);
         Serial.println("[WS] closed");
         break;
 
@@ -216,15 +233,17 @@ static void on_ws(WStype_t t, uint8_t* payload, size_t len) {
             sessionId  = d["session_id"] | "";
             helloAcked = true;
             Serial.printf("[WS] ready · session=%s\n", sessionId.c_str());
-            tft_status("Online", "Hold BTN to talk", ST77XX_GREEN);
+            convo = false;
+            show_standby();
             state = IDLE;
 
         } else if (!strcmp(mt, "stt")) {
             const char* txt = d["text"] | "";
             if (txt[0] && txt[0] != '%') {
                 Serial.printf("[STT] %s\n", txt);
-                tft_status("Thinking…", txt, ST77XX_YELLOW);
+                tft_status("Thinking...", txt, ST77XX_YELLOW);
                 state = PROCESSING;
+                convoActiveAt = millis();
             }
 
         } else if (!strcmp(mt, "alert")) {
@@ -234,6 +253,7 @@ static void on_ws(WStype_t t, uint8_t* payload, size_t len) {
             const char* msg = d["message"] | "";
             Serial.printf("[ALERT] %s: %s\n", st, msg);
             state = IDLE;
+            convo = false;   // the server ended the conversation
             tft_status(st, msg, ST77XX_RED);
 
         } else if (!strcmp(mt, "llm")) {
@@ -243,13 +263,18 @@ static void on_ws(WStype_t t, uint8_t* payload, size_t len) {
             const char* s = d["state"] | "";
             if (!strcmp(s, "start")) {
                 state = SPEAKING;
+                convoActiveAt = millis();
             } else if (!strcmp(s, "sentence_start")) {
                 Serial.printf("[TTS] %s\n", d["text"] | "");
-                tft_status("Speaking…", d["text"] | "", ST77XX_CYAN);
+                tft_status("Speaking...", d["text"] | "", ST77XX_CYAN);
             } else if (!strcmp(s, "stop")) {
                 Serial.println("[TTS] done");
-                state = IDLE;
-                tft_status("Online", "Hold BTN to talk", ST77XX_GREEN);
+                if (convo) {
+                    resume_listening();
+                } else {
+                    state = IDLE;
+                    show_standby();
+                }
             }
         }
         break;
@@ -264,52 +289,44 @@ static void on_ws(WStype_t t, uint8_t* payload, size_t len) {
 }
 
 /* ── Button ────────────────────────────────────────────────────── */
-// Hold = push-to-talk, however long you talk. Pressing while the robot is
-// thinking/speaking interrupts it instead (that press doesn't start a turn).
-static bool          pttActive    = false;
-static bool          btnPrev      = HIGH;
-static bool          swallowPress = false;  // this press was used to interrupt
-static bool          btnArmed     = false;  // seen released since boot
-static unsigned long btnPressAt   = 0;
+// Tap = start a hands-free conversation. Tap while it's thinking/speaking =
+// interrupt (conversation continues). Tap while it's listening = end it.
+static bool          btnPrev    = HIGH;
+static bool          btnArmed   = false;  // seen released since boot
+static unsigned long btnPressAt = 0;
+
+static void end_conversation(const char* why) {
+    convo = false;
+    state = IDLE;
+    ws_listen("stop", "auto");
+    show_standby();
+    Serial.printf("[CONVO] off (%s)\n", why);
+}
 
 static void handle_button() {
     bool cur = digitalRead(PIN_BTN);
     if (cur == HIGH) btnArmed = true;   // resets can leave GPIO0 low at boot
     if (!btnArmed) { btnPrev = cur; return; }
 
-    // A turn can end without a release (disconnect, server stop): never let a
-    // stale pttActive block the next press.
-    if (pttActive && state != LISTENING) pttActive = false;
-
-    if (btnPrev == HIGH && cur == LOW) {      // press
-        btnPressAt   = millis();
-        swallowPress = false;
-        if (state == PROCESSING || state == SPEAKING) {
-            ws_abort();
-            state        = IDLE;
-            swallowPress = true;
-            tft_status("Online", "Hold BTN to talk", ST77XX_GREEN);
-            Serial.println("[BTN] interrupt");
-        }
-    }
-
-    if (cur == LOW && !swallowPress && !pttActive && helloAcked && state == IDLE
-            && millis() - btnPressAt > 50) {   // debounced hold while idle
-        pttActive = true;
-        state     = LISTENING;
-        ws_listen("start");
-        tft_status("Listening...", "release to send", ST77XX_ORANGE);
-        Serial.println("[BTN] start");
-    }
-
-    if (btnPrev == LOW && cur == HIGH && pttActive) {   // release ends the turn
-        pttActive = false;
-        ws_listen("stop");
-        state = PROCESSING;
-        tft_status("Thinking...", "", ST77XX_YELLOW);
-        Serial.printf("[BTN] stop · %lu ms\n", millis() - btnPressAt);
-    }
+    if (btnPrev == HIGH && cur == LOW) btnPressAt = millis();
+    bool tap = btnPrev == LOW && cur == HIGH && millis() - btnPressAt > 30;  // debounced release
     btnPrev = cur;
+    if (!tap || !helloAcked) return;
+
+    if (state == PROCESSING || state == SPEAKING) {
+        ws_abort();
+        Serial.println("[BTN] interrupt");
+        if (convo) resume_listening();
+        else { state = IDLE; show_standby(); }
+    } else if (convo) {
+        end_conversation("button");
+    } else {
+        convo = true;
+        ws_listen("start", "auto");
+        resume_listening();
+        micResumeAt = millis();
+        Serial.println("[CONVO] on");
+    }
 }
 
 /* ── Mic streaming ──────────────────────────────────────────────── */
@@ -321,7 +338,7 @@ static int32_t micRaw[MIC_FRAME_SAMPLES];
 static int16_t micPcm[MIC_FRAME_SAMPLES];
 static float   hpPrevIn = 0, hpPrevOut = 0;
 
-static void stream_mic() {
+static void stream_mic(bool send) {
     size_t nr = 0;
     if (i2s_read(I2S_NUM_0, micRaw, sizeof(micRaw), &nr, 0) != ESP_OK || nr == 0)
         return;
@@ -333,7 +350,8 @@ static void stream_mic() {
         float v = y * (MIC_GAIN / 256.0f);                  // 24 -> 16 bit, x gain
         micPcm[i] = (int16_t)(v > 32767.f ? 32767.f : v < -32768.f ? -32768.f : v);
     }
-    ws.sendBIN((const uint8_t*)micPcm, n * sizeof(int16_t));
+    // Drained even when muted, so stale audio (incl. our own voice) is never sent later.
+    if (send) ws.sendBIN((const uint8_t*)micPcm, n * sizeof(int16_t));
 }
 
 /* ── Entry ─────────────────────────────────────────────────────── */
@@ -379,6 +397,9 @@ void setup() {
 void loop() {
     ws.loop();
     handle_button();
-    if (state == LISTENING && pttActive)
-        stream_mic();
+    if (convo) {
+        stream_mic(state == LISTENING && (long)(millis() - micResumeAt) >= 0);
+        if (state == LISTENING && millis() - convoActiveAt > CONVO_IDLE_MS)
+            end_conversation("idle");
+    }
 }
