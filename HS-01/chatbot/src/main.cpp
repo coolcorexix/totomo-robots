@@ -262,43 +262,47 @@ static void on_ws(WStype_t t, uint8_t* payload, size_t len) {
 }
 
 /* ── Button ────────────────────────────────────────────────────── */
-static bool         pttActive    = false;
-static bool         btnPrev      = HIGH;
-static unsigned long btnPressAt  = 0;
+// Hold = push-to-talk, however long you talk. Pressing while the robot is
+// thinking/speaking interrupts it instead (that press doesn't start a turn).
+static bool          pttActive    = false;
+static bool          btnPrev      = HIGH;
+static bool          swallowPress = false;  // this press was used to interrupt
+static unsigned long btnPressAt   = 0;
 
 static void handle_button() {
     bool cur = digitalRead(PIN_BTN);
 
+    // A turn can end without a release (disconnect, server stop): never let a
+    // stale pttActive block the next press.
+    if (pttActive && state != LISTENING) pttActive = false;
+
     if (btnPrev == HIGH && cur == LOW) {      // press
-        btnPressAt = millis();
-        btnPrev    = LOW;
-    }
-
-    if (btnPrev == LOW && cur == HIGH) {      // release
-        unsigned long held = millis() - btnPressAt;
-        btnPrev = HIGH;
-
-        if (held >= BTN_LONG_PRESS_MS) {
-            if (state != IDLE) { ws_abort(); state = IDLE; }
+        btnPressAt   = millis();
+        swallowPress = false;
+        if (state == PROCESSING || state == SPEAKING) {
+            ws_abort();
+            state        = IDLE;
+            swallowPress = true;
             tft_status("Online", "Hold BTN to talk", ST77XX_GREEN);
-            Serial.println("[BTN] abort");
-        } else if (pttActive) {
-            pttActive = false;
-            ws_listen("stop");
-            state = PROCESSING;
-            tft_status("Thinking…", "", ST77XX_YELLOW);
-            Serial.printf("[BTN] stop · %lu ms\n", held);
+            Serial.println("[BTN] interrupt");
         }
     }
 
-    if (cur == LOW && !pttActive && helloAcked && state == IDLE) {
-        if ((millis() - btnPressAt) > 50) {
-            pttActive = true;
-            state     = LISTENING;
-            ws_listen("start");
-            tft_status("Listening…", "release to send", ST77XX_ORANGE);
-            Serial.println("[BTN] start");
-        }
+    if (cur == LOW && !swallowPress && !pttActive && helloAcked && state == IDLE
+            && millis() - btnPressAt > 50) {   // debounced hold while idle
+        pttActive = true;
+        state     = LISTENING;
+        ws_listen("start");
+        tft_status("Listening...", "release to send", ST77XX_ORANGE);
+        Serial.println("[BTN] start");
+    }
+
+    if (btnPrev == LOW && cur == HIGH && pttActive) {   // release ends the turn
+        pttActive = false;
+        ws_listen("stop");
+        state = PROCESSING;
+        tft_status("Thinking...", "", ST77XX_YELLOW);
+        Serial.printf("[BTN] stop · %lu ms\n", millis() - btnPressAt);
     }
     btnPrev = cur;
 }
